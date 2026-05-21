@@ -1,6 +1,16 @@
-FROM node:14
+FROM node:20-alpine
+
 WORKDIR /usr/src/app
-COPY package*.json ./
+
+# * copy package.json and package-lock.json to the container
+COPY package*.json ./    
+
+# install dependencies
 RUN npm install
+
+# copy the rest of the application code to the container
 COPY . .
-CMD [ "npm", "start" ]
+
+# start the front-end app
+CMD ["npm","start"]
+

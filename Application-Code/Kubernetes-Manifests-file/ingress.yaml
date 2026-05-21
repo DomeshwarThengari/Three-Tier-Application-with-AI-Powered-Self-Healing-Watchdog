@@ -8,9 +8,9 @@ metadata:
     alb.ingress.kubernetes.io/target-type: ip
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
 spec:
-  ingressClassName: alb
+  ingressClassName: alb   # ingress have multiple classes This indicates that we are using AWS Load Balancer Controller to create the load balancer.
   rules:
-    - host: backend.amanpathakdevops.study
+    - host: backend.domeshwarthengari.com   # add your hosted domain name here.
       http:
         paths:
           - path: /api
@@ -19,7 +19,7 @@ spec:
               service:
                 name: api
                 port:   
-                  number: 3500
+                  number: 8080
           - path: /
             pathType: Prefix
             backend:
@@ -27,4 +27,3 @@ spec:
                 name: frontend
                 port: 
                   number: 3000
-      

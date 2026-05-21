@@ -21,11 +21,11 @@ spec:
       labels:
         role: api
     spec:
-      imagePullSecrets:
-      - name: ecr-registry-secret
+      # imagePullSecrets:
+      # - name: ecr-registry-secret
       containers:
       - name: api
-        image: 407622020962.dkr.ecr.us-east-1.amazonaws.com/backend:latest
+        image: 975829620031.dkr.ecr.us-east-1.amazonaws.com/backend-docker-image:latest
         imagePullPolicy: Always
         env:
           - name: MONGO_CONN_STR
@@ -41,17 +41,17 @@ spec:
                 name: mongo-sec
                 key: password
         ports:
-        - containerPort: 3500
+        - containerPort: 8080
         livenessProbe: 
           httpGet:
             path: /ok
-            port: 3500
+            port: 8080
           initialDelaySeconds: 2
           periodSeconds: 5
         readinessProbe:
           httpGet:
             path: /ok
-            port: 3500
+            port: 8080
           initialDelaySeconds: 5
           periodSeconds: 5
           successThreshold: 1
