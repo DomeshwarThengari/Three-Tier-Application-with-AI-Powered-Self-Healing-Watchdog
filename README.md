@@ -14,6 +14,7 @@ Before you begin, ensure you have the following:
 ### Tools Explored
 * Kubernetes
 * AWS EKS
+* AWS ECR
 * Docker
 * AWS CLI
 * eksctl
