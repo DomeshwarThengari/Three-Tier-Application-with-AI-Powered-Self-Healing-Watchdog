@@ -9,9 +9,19 @@ connection();
 app.use(express.json());
 app.use(cors());
 
-app.get('/ok', (req, res) => {
-    res.status(200).send('ok')
-  })
+const mongoose = require("mongoose");
+
+app.get('/ok', async (req, res) => {
+    try {
+        if (mongoose.connection.readyState !== 1) {
+            return res.status(500).send('database disconnected');
+        }
+        await mongoose.connection.db.admin().ping();
+        res.status(200).send('ok');
+    } catch (err) {
+        res.status(500).send('database ping failed');
+    }
+});
 
 app.use("/api/tasks", tasks);
 

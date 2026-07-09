@@ -1,0 +1,20 @@
+# Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# SQLite databases (local tests)
+*.db
+*.sqlite
+
+# AI assistant caching (Qodo)
+.qodo/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local

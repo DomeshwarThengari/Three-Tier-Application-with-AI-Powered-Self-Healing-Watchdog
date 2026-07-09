@@ -1,0 +1,86 @@
+services:
+  database:
+    image: mongo:4.4.6
+    container_name: three-tier-db
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USERNAME}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASSWORD}
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - three-tier-network
+
+  backend:
+    image: three-tier-backend:latest
+    container_name: three-tier-backend
+    ports:
+      - "3500:3500"
+    environment:
+      - PORT=3500
+      - MONGO_CONN_STR=mongodb://database:27017/todo?authSource=admin
+      - USE_DB_AUTH=true
+      - MONGO_USERNAME=${MONGO_USERNAME}
+      - MONGO_PASSWORD=${MONGO_PASSWORD}
+    depends_on:
+      - database
+    networks:
+      - three-tier-network
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3500/ok" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  frontend:
+    image: three-tier-frontend:latest
+    container_name: three-tier-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_BACKEND_URL=http://localhost:3500/api/tasks
+      - NODE_OPTIONS=--openssl-legacy-provider
+    depends_on:
+      - backend
+    networks:
+      - three-tier-network
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # AI Self-Healing Monitor Agent
+  ai-watchdog:
+    image: three-tier-watchdog:latest
+    container_name: ai-watchdog
+    ports:
+      - "8085:8080"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ALERT_EMAIL=${ALERT_EMAIL}
+      - SENDER_EMAIL=${SENDER_EMAIL}
+      - SENDER_PASSWORD=${SENDER_PASSWORD}
+      - AGENT_URL=${AGENT_URL}
+      - PYTHONUNBUFFERED=1
+      - WATCHDOG_SECRET=${WATCHDOG_SECRET}
+      # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      # - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - watchdog_data:/app/data # <--- Mounts persistent directory inside the container
+    restart: always
+    networks:
+      - three-tier-network
+volumes:
+  mongodb_data:
+  watchdog_data:
+    # <--- Declares the named volume
+
+networks:
+  three-tier-network:
+    driver: bridge

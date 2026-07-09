@@ -30,7 +30,7 @@ class App extends Tasks {
                             </Button>
                         </form>
                         <div className="tasks-list">
-                            {tasks.map((task) => (
+                            {Array.isArray(tasks) && tasks.map((task) => (
                                 <Paper key={task._id} className="task-item">
                                     <Checkbox
                                         checked={task.completed}
