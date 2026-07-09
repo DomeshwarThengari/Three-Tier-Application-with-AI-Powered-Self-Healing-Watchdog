@@ -26,12 +26,12 @@ graph TD
     Frontend -->|Queries API Port 3500| Backend[Node.js Backend]
     Backend -->|Mongoose DB Connect| Database[(MongoDB Database)]
     
-    subgraph Docker Daemon Host
+    subgraph "Docker Daemon Host"
         DockerEvents[Docker Daemon Event Stream]
         ContainerStates[Container Healthchecks]
     end
 
-    subgraph Watchdog Stack (Port 8085)
+    subgraph "Watchdog Stack (Port 8085)"
         Watchdog[Watchdog Monitor Loop]
         SQLite[(Watchdog SQLite DB)]
         DashboardWeb[FastAPI Glassmorphic Dashboard]
