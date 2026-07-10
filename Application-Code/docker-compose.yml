@@ -56,6 +56,7 @@ services:
   # AI Self-Healing Monitor Agent
   ai-watchdog:
     image: three-tier-watchdog:latest
+    build: ./watchdog
     container_name: ai-watchdog
     ports:
       - "8085:8080"
@@ -70,6 +71,8 @@ services:
       # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       # - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - DASHBOARD_USERNAME=${DASHBOARD_USERNAME}
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - watchdog_data:/app/data # <--- Mounts persistent directory inside the container

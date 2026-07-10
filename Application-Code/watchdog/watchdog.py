@@ -9,7 +9,8 @@ import google.generativeai as genai
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import logging
@@ -79,6 +80,49 @@ def verify_signed_url(action_id: str, signature: str, expires: str) -> bool:
 genai.configure(api_key=GEMINI_API_KEY)
 docker_client = docker.DockerClient(base_url=DOCKER_SOCKET)
 app = FastAPI(title="AI Self-Healing Watchdog")
+
+security = HTTPBasic()
+DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "watchdogsecret")
+
+def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = hmac.compare_digest(credentials.username.encode("utf-8"), DASHBOARD_USERNAME.encode("utf-8"))
+    correct_password = hmac.compare_digest(credentials.password.encode("utf-8"), DASHBOARD_PASSWORD.encode("utf-8"))
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+# Anti-flapping configuration & state
+remediation_history = {}
+history_lock = threading.Lock()
+
+MAX_RESTOPS_LIMIT = 3
+COOLDOWN_WINDOW_SECONDS = 600  # 10 minutes
+
+def check_anti_flapping(container_name: str) -> bool:
+    """
+    Checks if a container has exceeded recovery limits (flapping).
+    Returns True if flapping is detected, and False otherwise.
+    """
+    now = time.time()
+    with history_lock:
+        timestamps = remediation_history.get(container_name, [])
+        valid_timestamps = [t for t in timestamps if now - t < COOLDOWN_WINDOW_SECONDS]
+        remediation_history[container_name] = valid_timestamps
+        if len(valid_timestamps) >= MAX_RESTOPS_LIMIT:
+            return True
+        return False
+
+def record_remediation(container_name: str):
+    now = time.time()
+    with history_lock:
+        if container_name not in remediation_history:
+            remediation_history[container_name] = []
+        remediation_history[container_name].append(now)
 
 DB_PATH = "/app/data/watchdog.db"
 try:
@@ -393,9 +437,104 @@ def send_slack_alert(action_id: str, container_name: str, diagnosis: str, comman
     except Exception as e:
         logger.error(f"Failed to post Slack alert: {e}")
 
+def send_slack_antiflap_alert(container_name: str):
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        logger.warning("[WARNING] Slack webhook URL not configured. Skipping anti-flap alert.")
+        return
+        
+    payload = {
+        "blocks": [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "🛑 CRITICAL: Anti-Flapping Triggered"}
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Container:* `{container_name}`\n*Alert:* Remediation blocked to prevent infinite restart loop.\n*Details:* Container exceeded the limit of {MAX_RESTOPS_LIMIT} restarts in {COOLDOWN_WINDOW_SECONDS // 60} minutes."
+                }
+            }
+        ]
+    }
+    
+    try:
+        requests.post(webhook_url, json=payload)
+        logger.info(f"Anti-flap Slack alert posted for {container_name}.")
+    except Exception as e:
+        logger.error(f"Failed to post anti-flap Slack alert: {e}")
+
+def send_slack_autoheal_start(container_name: str, diagnosis: str, command: str):
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        return
+        
+    payload = {
+        "blocks": [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "⚡ Auto-Healing Recovery Initiated"}
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Container:* `{container_name}`\n*Diagnosis:* {diagnosis}\n*Auto-healing Action:* `{command}`\n*Risk Level:* `low` (Executing immediately)"
+                }
+            }
+        ]
+    }
+    try:
+        requests.post(webhook_url, json=payload)
+    except Exception as e:
+        logger.error(f"Failed to post autoheal start alert: {e}")
+
+def execute_remediation(action_id: str, command: str, container_name: str):
+    # Check anti-flapping guard
+    if check_anti_flapping(container_name):
+        logger.critical(f"[ANTI-FLAPPING BLOCKED] Remediation blocked for '{container_name}': exceeded restart limit.")
+        update_action_status(action_id, "blocked")
+        send_slack_antiflap_alert(container_name)
+        return
+
+    try:
+        cmd = command.strip()
+        
+        # 1. Validate command format and container target
+        if not validate_command(cmd):
+            logger.warning(f"[SECURITY WARNING] Blocked execution of unsafe command: {cmd}")
+            update_action_status(action_id, "failed")
+            return
+            
+        # 2. Execute safely using the Python Docker SDK (No shell interpreter used)
+        parts = cmd.split()
+        docker_action = parts[1]
+        target_container = parts[2]
+        
+        logger.info(f"Executing {docker_action} via Docker SDK for container: {target_container}")
+        container = docker_client.containers.get(target_container)
+        
+        if docker_action == "restart":
+            container.restart()
+        elif docker_action == "start":
+            container.start()
+        elif docker_action == "stop":
+            container.stop()
+            
+        # Record successful recovery for anti-flapping check
+        record_remediation(container_name)
+        
+        update_action_status(action_id, "success")
+        logger.info(f"Remediation succeeded via SDK for {container_name}")
+        
+    except Exception as e:
+        logger.error(f"Failed to execute command: {e}")
+        update_action_status(action_id, "failed")
+
 def analyze_logs_and_remediate(container_name: str, logs: str):
     """
-    Sends container logs to Gemini, asks for diagnosis and fix command.
+    Sends container logs to Gemini, asks for diagnosis, fix command, and risk classification.
     """
     # Check dependencies first
     is_healthy, dep_msg = check_dependencies_healthy(container_name)
@@ -414,11 +553,15 @@ def analyze_logs_and_remediate(container_name: str, logs: str):
     Analyze the logs and provide:
     1. A short diagnosis of the root cause.
     2. The exact single command to recover or restart the service safely (e.g. 'docker restart {container_name}').
+    3. A risk classification for executing this recovery action:
+       - 'low': Stateless containers, simple frontend/backend service restarts, or healthcheck recovery.
+       - 'medium' or 'high': Stateful containers (e.g. database), commands risking data loss, or complex setups.
     
     You MUST respond with a JSON object containing exactly these keys:
     {{
       "diagnosis": "A concise explanation of the root cause.",
-      "command": "The exact docker command to recover the service."
+      "command": "The exact docker command to recover the service.",
+      "risk_level": "low" or "medium" or "high"
     }}
     """
     
@@ -434,16 +577,30 @@ def analyze_logs_and_remediate(container_name: str, logs: str):
             result = json.loads(response_text)
             diagnosis = result.get("diagnosis", "Unknown error")
             command = result.get("command", f"docker restart {container_name}")
+            risk_level = result.get("risk_level", "medium")
         except Exception as json_err:
             logger.error(f"Failed to parse Gemini response as JSON: {json_err}. Raw response: {response_text}")
             diagnosis = "Unknown error (JSON parsing failed)"
             command = f"docker restart {container_name}"
+            risk_level = "medium"
             
         action_id = str(uuid.uuid4())
-        save_action(action_id, container_name, command, diagnosis, "pending")
         
-        # Send Notification
-        send_slack_alert(action_id, container_name, diagnosis, command)
+        if risk_level == "low":
+            # Auto-healing path: execute immediately
+            logger.info(f"[AUTO-HEALING] Low-risk issue detected for {container_name}. Executing recovery immediately...")
+            save_action(action_id, container_name, command, diagnosis, "executing")
+            send_slack_autoheal_start(container_name, diagnosis, command)
+            # Run execution in a background thread to avoid blocking docker event monitoring
+            threading.Thread(
+                target=execute_remediation,
+                args=(action_id, command, container_name),
+                daemon=True
+            ).start()
+        else:
+            # Human-in-the-loop path: save as pending and notify
+            save_action(action_id, container_name, command, diagnosis, "pending")
+            send_slack_alert(action_id, container_name, diagnosis, command)
         
     except Exception as e:
         logger.error(f"Error during AI analysis: {e}")
@@ -480,7 +637,7 @@ def monitor_loop():
 
 # API Endpoints for Human-in-the-Loop Approvals
 @app.get("/", response_class=HTMLResponse)
-def get_dashboard():
+def get_dashboard(username: str = Depends(authenticate)):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -491,7 +648,7 @@ def get_dashboard():
     total_actions = len(rows)
     pending_count = sum(1 for r in rows if r[4] == "pending")
     success_count = sum(1 for r in rows if r[4] in ["success", "executing"])
-    failed_count = sum(1 for r in rows if r[4] in ["failed", "error", "rejected"])
+    failed_count = sum(1 for r in rows if r[4] in ["failed", "error", "rejected", "blocked"])
     
     rows_html = ""
     for r in rows:
@@ -512,7 +669,11 @@ def get_dashboard():
             
         rows_html += f"""
         <tr>
-            <td style="font-weight: 600; color: #38bdf8;">{container_name}</td>
+            <td style="font-weight: 600; color: #38bdf8;">
+                {container_name}
+                <br/>
+                <a href="/logs/{container_name}" style="color: #818cf8; font-size: 0.75rem; text-decoration: none; font-weight: normal;">[View Logs]</a>
+            </td>
             <td>{diagnosis}</td>
             <td><code>{command}</code></td>
             <td><span class="badge {badge_cls}">{status}</span></td>
@@ -667,6 +828,11 @@ def get_dashboard():
                 color: #94a3b8;
                 border: 1px solid rgba(148, 163, 184, 0.3);
             }}
+            .badge-blocked {{
+                background: rgba(239, 68, 68, 0.15);
+                color: #fca5a5;
+                border: 1px solid rgba(239, 68, 68, 0.3);
+            }}
             .btn {{
                 display: inline-flex;
                 align-items: center;
@@ -755,7 +921,7 @@ def get_dashboard():
     return html_content
 
 @app.get("/approve/{action_id}", response_class=HTMLResponse)
-def approve_action(action_id: str, signature: str, expires: str, background_tasks: BackgroundTasks):
+def approve_action(action_id: str, signature: str, expires: str, background_tasks: BackgroundTasks, username: str = Depends(authenticate)):
     if not verify_signed_url(action_id, signature, expires):
         return "<h3 style='color: #c62828;'>Forbidden: Invalid or expired link signature.</h3>"
         
@@ -768,40 +934,8 @@ def approve_action(action_id: str, signature: str, expires: str, background_task
         
     update_action_status(action_id, "executing")
     
-    # Run fix command safely in background
-    def execute():
-        try:
-            cmd = action.command.strip()
-            
-            # 1. Validate command format and container target
-            if not validate_command(cmd):
-                logger.warning(f"[SECURITY WARNING] Blocked execution of unsafe command: {cmd}")
-                update_action_status(action_id, "failed")
-                return
-                
-            # 2. Execute safely using the Python Docker SDK (No shell interpreter used)
-            parts = cmd.split()
-            docker_action = parts[1]
-            target_container = parts[2]
-            
-            logger.info(f"Executing {docker_action} via Docker SDK for container: {target_container}")
-            container = docker_client.containers.get(target_container)
-            
-            if docker_action == "restart":
-                container.restart()
-            elif docker_action == "start":
-                container.start()
-            elif docker_action == "stop":
-                container.stop()
-                
-            update_action_status(action_id, "success")
-            logger.info(f"Remediation succeeded via SDK for {action.container_name}")
-            
-        except Exception as e:
-            update_action_status(action_id, "error")
-            logger.error(f"Error executing fix: {e}")
-            
-    background_tasks.add_task(execute)
+    # Run execute_remediation safely in background
+    background_tasks.add_task(execute_remediation, action_id, action.command, action.container_name)
     
     return f"""
     <html>
@@ -815,7 +949,7 @@ def approve_action(action_id: str, signature: str, expires: str, background_task
     """
 
 @app.get("/reject/{action_id}", response_class=HTMLResponse)
-def reject_action(action_id: str, signature: str, expires: str):
+def reject_action(action_id: str, signature: str, expires: str, username: str = Depends(authenticate)):
     if not verify_signed_url(action_id, signature, expires):
         return "<h3 style='color: #c62828;'>Forbidden: Invalid or expired link signature.</h3>"
         
@@ -833,6 +967,76 @@ def reject_action(action_id: str, signature: str, expires: str):
         </body>
     </html>
     """
+
+@app.get("/logs/{container_name}", response_class=HTMLResponse)
+def get_container_logs(container_name: str, username: str = Depends(authenticate)):
+    # Verify container name is valid and exists on host
+    try:
+        container = docker_client.containers.get(container_name)
+        logs = container.logs(tail=100, stdout=True, stderr=True).decode('utf-8')
+    except Exception as e:
+        logs = f"Error fetching logs for container '{container_name}': {e}"
+        
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Logs - {container_name}</title>
+        <style>
+            body {{
+                background: #0f172a;
+                color: #38bdf8;
+                font-family: monospace;
+                padding: 2rem;
+                margin: 0;
+            }}
+            .header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid #334155;
+                padding-bottom: 1rem;
+                margin-bottom: 1rem;
+            }}
+            .header h1 {{
+                margin: 0;
+                font-size: 1.5rem;
+                color: #f1f5f9;
+            }}
+            .back-btn {{
+                background: #1e293b;
+                color: #f1f5f9;
+                text-decoration: none;
+                padding: 0.5rem 1rem;
+                border-radius: 6px;
+                font-size: 0.875rem;
+            }}
+            .back-btn:hover {{
+                background: #334155;
+            }}
+            pre {{
+                background: #020617;
+                padding: 1.5rem;
+                border-radius: 8px;
+                border: 1px solid #1e293b;
+                overflow-x: auto;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+                color: #10b981;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>Logs for container: {container_name}</h1>
+            <a href="/" class="back-btn">&larr; Back to Dashboard</a>
+        </div>
+        <pre>{logs}</pre>
+    </body>
+    </html>
+    """
+    return html_content
 
 @app.on_event("startup")
 def startup_event():
