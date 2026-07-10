@@ -62,6 +62,18 @@ graph TD
 * **AI-Powered Diagnostics**:
   * Captures container exit codes, termination signals, and stderr logs when an outage happens.
   * Utilizes Google Gemini's reasoning to output structured JSON diagnostic reports and remediation commands.
+* **Basic Authentication Security**:
+  * Restricts access to the dashboard page (`/`), approve/reject paths, and container logs using HTTP Basic Authentication.
+  * Controlled via `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` in the environment configuration.
+* **Live Container Log Viewer**:
+  * Streams stdout/stderr logs of any active or exited container directly in the browser via `/logs/{container_name}`.
+  * Linked next to container names on the operational dashboard table.
+* **Dynamic Risk-Based Auto-Healing**:
+  * Integrates Gemini's reasoning to evaluate the risk level (`low`, `medium`, `high`) of proposed repairs.
+  * Instantly executes repairs for `low` risk incidents automatically while alerting Slack, reserving manual approval loops only for higher-risk events.
+* **Anti-Flapping & Cooldown Guards**:
+  * Prevents infinite restart loops by capping automatic recovery to a maximum of 3 restarts within a sliding 10-minute window.
+  * Automatically locks runaway recoveries, flagging the incident as `blocked` in red, and posts high-priority warnings to Slack.
 * **Dependency-Aware Remediation**:
   * Enforces container relationship constraints (e.g., Frontend depends on Backend; Backend depends on MongoDB).
   * If a service fails but its upstream dependency is already dead or restarting, remediation is **deferred** automatically to prevent restart-loop cascading failures.
@@ -103,6 +115,8 @@ MONGO_PASSWORD=jojo@12
 # Watchdog Configuration
 WATCHDOG_SECRET=your_32_character_hex_secret_here
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/your/webhook/path
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=your_dashboard_password_here
 
 # Alert Email Configuration (Optional fallback notifications)
 ALERT_EMAIL=operator@example.com
