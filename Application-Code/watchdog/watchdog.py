@@ -142,12 +142,17 @@ def init_db():
             command TEXT,
             diagnosis TEXT,
             status TEXT,
-            created_at TEXT
+            created_at TEXT,
+            failure_logs TEXT
         )
     """)
-    # Migrate existing databases by adding the created_at column if missing
+    # Migrate existing databases by adding columns if missing
     try:
         cursor.execute("ALTER TABLE actions ADD COLUMN created_at TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    try:
+        cursor.execute("ALTER TABLE actions ADD COLUMN failure_logs TEXT")
     except sqlite3.OperationalError:
         pass  # Column already exists
     conn.commit()
@@ -155,7 +160,7 @@ def init_db():
 
 init_db()
 
-def save_action(action_id: str, container_name: str, command: str, diagnosis: str, status: str = "pending"):
+def save_action(action_id: str, container_name: str, command: str, diagnosis: str, status: str = "pending", failure_logs: str = None):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
@@ -164,14 +169,20 @@ def save_action(action_id: str, container_name: str, command: str, diagnosis: st
     cursor.execute("SELECT id FROM actions WHERE id = ?", (action_id,))
     exists = cursor.fetchone()
     if exists:
-        cursor.execute(
-            "UPDATE actions SET container_name = ?, command = ?, diagnosis = ?, status = ? WHERE id = ?",
-            (container_name, command, diagnosis, status, action_id)
-        )
+        if failure_logs is not None:
+            cursor.execute(
+                "UPDATE actions SET container_name = ?, command = ?, diagnosis = ?, status = ?, failure_logs = ? WHERE id = ?",
+                (container_name, command, diagnosis, status, failure_logs, action_id)
+            )
+        else:
+            cursor.execute(
+                "UPDATE actions SET container_name = ?, command = ?, diagnosis = ?, status = ? WHERE id = ?",
+                (container_name, command, diagnosis, status, action_id)
+            )
     else:
         cursor.execute(
-            "INSERT INTO actions (id, container_name, command, diagnosis, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (action_id, container_name, command, diagnosis, status, now_str)
+            "INSERT INTO actions (id, container_name, command, diagnosis, status, created_at, failure_logs) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (action_id, container_name, command, diagnosis, status, now_str, failure_logs)
         )
     conn.commit()
     conn.close()
@@ -589,7 +600,7 @@ def analyze_logs_and_remediate(container_name: str, logs: str):
         if risk_level == "low":
             # Auto-healing path: execute immediately
             logger.info(f"[AUTO-HEALING] Low-risk issue detected for {container_name}. Executing recovery immediately...")
-            save_action(action_id, container_name, command, diagnosis, "executing")
+            save_action(action_id, container_name, command, diagnosis, "executing", logs)
             send_slack_autoheal_start(container_name, diagnosis, command)
             # Run execution in a background thread to avoid blocking docker event monitoring
             threading.Thread(
@@ -599,7 +610,7 @@ def analyze_logs_and_remediate(container_name: str, logs: str):
             ).start()
         else:
             # Human-in-the-loop path: save as pending and notify
-            save_action(action_id, container_name, command, diagnosis, "pending")
+            save_action(action_id, container_name, command, diagnosis, "pending", logs)
             send_slack_alert(action_id, container_name, diagnosis, command)
         
     except Exception as e:
@@ -641,7 +652,7 @@ def get_dashboard(username: str = Depends(authenticate)):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    cursor.execute("SELECT id, container_name, command, diagnosis, status, created_at FROM actions ORDER BY created_at DESC")
+    cursor.execute("SELECT id, container_name, command, diagnosis, status, created_at, failure_logs FROM actions ORDER BY created_at DESC")
     rows = cursor.fetchall()
     conn.close()
     
@@ -652,7 +663,7 @@ def get_dashboard(username: str = Depends(authenticate)):
     
     rows_html = ""
     for r in rows:
-        action_id, container_name, command, diagnosis, status, created_at = r
+        action_id, container_name, command, diagnosis, status, created_at, failure_logs = r
         badge_cls = f"badge-{status}"
         
         actions_cell = ""
@@ -667,12 +678,16 @@ def get_dashboard(username: str = Depends(authenticate)):
         else:
             actions_cell = "<span style='color: #64748b;'>No action needed</span>"
             
+        logs_links = f'<a href="/logs/{container_name}" style="color: #818cf8; font-size: 0.75rem; text-decoration: none; font-weight: normal; margin-right: 0.5rem;">[View Live]</a>'
+        if failure_logs:
+            logs_links += f'<a href="/failure-logs/{action_id}" style="color: #ef4444; font-size: 0.75rem; text-decoration: none; font-weight: normal;">[View Failure]</a>'
+            
         rows_html += f"""
         <tr>
             <td style="font-weight: 600; color: #38bdf8;">
                 {container_name}
                 <br/>
-                <a href="/logs/{container_name}" style="color: #818cf8; font-size: 0.75rem; text-decoration: none; font-weight: normal;">[View Logs]</a>
+                {logs_links}
             </td>
             <td>{diagnosis}</td>
             <td><code>{command}</code></td>
@@ -877,19 +892,19 @@ def get_dashboard(username: str = Depends(authenticate)):
             
             <div class="stats-grid">
                 <div class="stat-card">
-                    <div class="stat-val">{total_actions}</div>
+                    <div id="stat-total" class="stat-val">{total_actions}</div>
                     <div class="stat-label">Total Incidents</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-val" style="color: #f59e0b;">{pending_count}</div>
+                    <div id="stat-pending" class="stat-val" style="color: #f59e0b;">{pending_count}</div>
                     <div class="stat-label">Pending Approval</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-val" style="color: #10b981;">{success_count}</div>
+                    <div id="stat-success" class="stat-val" style="color: #10b981;">{success_count}</div>
                     <div class="stat-label">Recoveries Executed</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-val" style="color: #ef4444;">{failed_count}</div>
+                    <div id="stat-failed" class="stat-val" style="color: #ef4444;">{failed_count}</div>
                     <div class="stat-label">Bypassed / Failed</div>
                 </div>
             </div>
@@ -908,13 +923,73 @@ def get_dashboard(username: str = Depends(authenticate)):
                                 <th>Actions</th>
                             </tr>
                         </thead>
-                        <tbody>
+                        <tbody id="incidents-body">
                             {rows_html}
                         </tbody>
                     </table>
                 </div>
             </div>
         </div>
+        
+        <script>
+            async function pollIncidents() {{
+                try {{
+                    const response = await fetch('/api/incidents');
+                    if (!response.ok) return;
+                    const data = await response.json();
+                    
+                    document.getElementById('stat-total').innerText = data.stats.total;
+                    document.getElementById('stat-pending').innerText = data.stats.pending;
+                    document.getElementById('stat-success').innerText = data.stats.success;
+                    document.getElementById('stat-failed').innerText = data.stats.failed;
+                    
+                    const tbody = document.getElementById('incidents-body');
+                    if (data.incidents.length === 0) {{
+                        tbody.innerHTML = "<tr><td colspan='6' style='text-align: center; color: #64748b; padding: 3rem;'>No incidents reported yet. System status normal.</td></tr>";
+                        return;
+                    }}
+                    
+                    let newRows = '';
+                    for (const incident of data.incidents) {{
+                        const badgeCls = `badge-${{incident.status}}`;
+                        
+                        let logsLinks = `<a href="/logs/${{incident.container_name}}" style="color: #818cf8; font-size: 0.75rem; text-decoration: none; font-weight: normal; margin-right: 0.5rem;">[View Live]</a>`;
+                        if (incident.has_failure_logs) {{
+                            logsLinks += `<a href="/failure-logs/${{incident.id}}" style="color: #ef4444; font-size: 0.75rem; text-decoration: none; font-weight: normal;">[View Failure]</a>`;
+                        }}
+                        
+                        let actionsCell = '';
+                        if (incident.status === 'pending') {{
+                            actionsCell = `
+                            <a href="${{incident.approve_url}}" class="btn btn-approve">Approve</a>
+                            <a href="${{incident.reject_url}}" class="btn btn-reject">Reject</a>
+                            `;
+                        }} else {{
+                            actionsCell = `<span style='color: #64748b;'>No action needed</span>`;
+                        }}
+                        
+                        newRows += `
+                        <tr>
+                            <td style="font-weight: 600; color: #38bdf8;">
+                                ${{incident.container_name}}
+                                <br/>
+                                ${{logsLinks}}
+                            </td>
+                            <td>${{incident.diagnosis}}</td>
+                            <td><code>${{incident.command}}</code></td>
+                            <td><span class="badge ${{badgeCls}}">${{incident.status}}</span></td>
+                            <td>${{incident.created_at}}</td>
+                            <td>${{actionsCell}}</td>
+                        </tr>
+                        `;
+                    }}
+                    tbody.innerHTML = newRows;
+                }} catch (err) {{
+                    console.error("Failed polling incidents:", err);
+                }}
+            }}
+            setInterval(pollIncidents, 5000);
+        </script>
     </body>
     </html>
     """
@@ -1037,6 +1112,142 @@ def get_container_logs(container_name: str, username: str = Depends(authenticate
     </html>
     """
     return html_content
+
+@app.get("/failure-logs/{action_id}", response_class=HTMLResponse)
+def get_failure_logs(action_id: str, username: str = Depends(authenticate)):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT container_name, failure_logs FROM actions WHERE id = ?", (action_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return "<h3 style='color: #ef4444;'>Action not found.</h3>"
+        
+    container_name, logs = row
+    if not logs:
+        logs = "No failure logs archived for this incident."
+        
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Failure Logs - {container_name}</title>
+        <style>
+            body {{
+                background: #0f172a;
+                color: #f87171;
+                font-family: monospace;
+                padding: 2rem;
+                margin: 0;
+            }}
+            .header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid #334155;
+                padding-bottom: 1rem;
+                margin-bottom: 1rem;
+            }}
+            .header h1 {{
+                margin: 0;
+                font-size: 1.5rem;
+                color: #f1f5f9;
+            }}
+            .back-btn {{
+                background: #1e293b;
+                color: #f1f5f9;
+                text-decoration: none;
+                padding: 0.5rem 1rem;
+                border-radius: 6px;
+                font-size: 0.875rem;
+            }}
+            .back-btn:hover {{
+                background: #334155;
+            }}
+            pre {{
+                background: #020617;
+                padding: 1.5rem;
+                border-radius: 8px;
+                border: 1px solid #1e293b;
+                overflow-x: auto;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+                color: #fca5a5;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>Failure Logs (Captured at Outage): {container_name}</h1>
+            <a href="/" class="back-btn">&larr; Back to Dashboard</a>
+        </div>
+        <pre>{logs}</pre>
+    </body>
+    </html>
+    """
+    return html_content
+
+@app.get("/api/incidents")
+def get_api_incidents(username: str = Depends(authenticate)):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, container_name, command, diagnosis, status, created_at, failure_logs FROM actions ORDER BY created_at DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    incidents = []
+    total = 0
+    pending = 0
+    success = 0
+    failed = 0
+    
+    import time
+    now_ts = int(time.time())
+    
+    for r in rows:
+        action_id, container_name, command, diagnosis, status, created_at, failure_logs = r
+        total += 1
+        if status == "pending":
+            pending += 1
+        elif status == "success":
+            success += 1
+        elif status in ("failed", "bypassed", "blocked"):
+            failed += 1
+            
+        # Generate HMAC parameters for pending items
+        approve_url = ""
+        reject_url = ""
+        if status == "pending":
+            expires = now_ts + 600000
+            msg = f"{action_id}:{expires}"
+            import hmac, hashlib
+            sig = hmac.new(WATCHDOG_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+            approve_url = f"/approve/{action_id}?signature={sig}&expires={expires}"
+            reject_url = f"/reject/{action_id}?signature={sig}&expires={expires}"
+            
+        incidents.append({
+            "id": action_id,
+            "container_name": container_name,
+            "command": command,
+            "diagnosis": diagnosis,
+            "status": status,
+            "created_at": created_at,
+            "has_failure_logs": bool(failure_logs),
+            "approve_url": approve_url,
+            "reject_url": reject_url
+        })
+        
+    return {
+        "stats": {
+            "total": total,
+            "pending": pending,
+            "success": success,
+            "failed": failed
+        },
+        "incidents": incidents
+    }
 
 @app.on_event("startup")
 def startup_event():
